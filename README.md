@@ -1,5 +1,7 @@
 # 绿联 NAS 论坛签到 · 青龙面板版
 
+**仓库**：[thinkcodee/qinglong-ugreen-club-signin](https://github.com/thinkcodee/qinglong-ugreen-club-signin)
+
 把 [silence9527/MoviePilot-UgreenSignIn](https://github.com/silence9527/MoviePilot-UgreenSignIn) 改造成青龙面板可直接跑的签到脚本，带通知。
 
 ## 改了什么
@@ -31,7 +33,11 @@ tests/test_offline.py     离线自测（不联网、不需要真实 Cookie）
 ## 快速开始
 
 1. **依赖**：青龙 `依赖管理 → Python3 → 新建依赖` 填 `requests`（大多数青龙镜像已自带）。缺依赖时脚本会明确提示，不会静默失败。
-2. **放脚本**：`脚本管理` 新建文件 `ugreen_signin.py`，粘贴主脚本内容；或用订阅管理拉 raw 链接。
+2. **放脚本**：在 `脚本管理` 新建 `ugreen_signin.py` 并粘贴主脚本内容（推荐，私有仓库也无需额外鉴权）。
+
+   仓库地址：<https://github.com/thinkcodee/qinglong-ugreen-club-signin>
+
+   若仓库设为公开，也可用订阅管理拉取 raw 链接：`https://raw.githubusercontent.com/thinkcodee/qinglong-ugreen-club-signin/main/ugreen_signin.py`；私有仓库的 raw 链接需要鉴权，青龙订阅通常拉不到，直接粘贴文件内容最省事。
 3. **配 Cookie**：`环境变量 → 新建变量`，名称 `UGREEN_COOKIE`，值填论坛完整 Cookie。
 4. **建任务**：`定时任务 → 新建任务`
    - 名称：`绿联社区签到`
@@ -185,4 +191,4 @@ python -m unittest discover -s tests -v
 
 - 仅供自己的账号使用，遵守绿联社区的用户协议与积分规则。
 - 原插件与本脚本均为非官方工具，论坛改版后签到接口可能变化。
-- 原仓库为 MIT 许可；本改造沿用其状态判定与文案设计。
+- 上游插件仓库 [silence9527/MoviePilot-UgreenSignIn](https://github.com/silence9527/MoviePilot-UgreenSignIn) 为 MIT 许可；本改造沿用其状态判定与文案设计。
