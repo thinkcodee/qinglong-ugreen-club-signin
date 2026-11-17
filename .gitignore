@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+.env.*
+*.log
+ugreen_signin_debug.html
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
