@@ -92,13 +92,16 @@ class _Resp:
 class ScriptedClient(m.UgreenHttp):
     """按脚本化状态机返回页面，模拟论坛服务端。"""
 
-    def __init__(self, cfg, signed=False, login=False, never_sign=False, credit_signed=None):
+    def __init__(self, cfg, signed=False, login=False, never_sign=False,
+                 credit_signed=None, credit_signed_after_submit=False):
         super().__init__(VALID_COOKIE, cfg)
         self.signed = signed
         self.login = login
         self.never_sign = never_sign
-        # None = 积分流水跟随页面状态；True/False 用于单独验证兜底复核
+        # None = 积分流水跟随页面状态；True/False 用于单独验证前置确认
         self.credit_signed = credit_signed
+        # 模拟「提交之后积分流水才出现」：用于验证提交后的兜底复核
+        self.credit_signed_after_submit = credit_signed_after_submit
         self.submits = []
 
     def _get(self, url, **kwargs):
@@ -113,6 +116,8 @@ class ScriptedClient(m.UgreenHttp):
         if self.login:
             return _Resp(LOGIN_HTML, url)
         if "ac=credit" in query:
+            if self.credit_signed_after_submit and self.submits:
+                return _Resp(CREDIT_HTML, url)
             show = self.credit_signed if self.credit_signed is not None else self.signed
             return _Resp(CREDIT_HTML if show else CREDIT_EMPTY_HTML, url)
         if "_t=" in query:  # 复核请求
@@ -302,12 +307,31 @@ class TestFlow(unittest.TestCase):
         self.assertIn("未确认签到成功", r.message)
 
     def test_credit_fallback_confirms(self):
-        """页面文案没变，但积分流水出现当天签到记录 → 判成功。"""
+        """前置检查时没签到，提交后积分流水才出现 → 兜底复核判成功。"""
         cfg = m.Config(cookies=[VALID_COOKIE])
-        client = ScriptedClient(cfg, never_sign=True, credit_signed=True)
+        client = ScriptedClient(cfg, never_sign=True, credit_signed_after_submit=True)
         r = client.run("账号1")
         self.assertEqual(r.status, "success")
         self.assertIn("积分记录确认", r.extra)
+        self.assertTrue(client.submits)
+
+    def test_precheck_skips_submit(self):
+        """按钮还在但积分流水已有当天签到 → 前置确认后直接读积分，一个请求都不发。"""
+        cfg = m.Config(cookies=[VALID_COOKIE])
+        client = ScriptedClient(cfg, never_sign=True, credit_signed=True)
+        r = client.run("账号1")
+        self.assertEqual(r.status, "already")
+        self.assertEqual(client.submits, [])
+        self.assertEqual(r.stats.balance, 78)
+        self.assertEqual(r.stats.today_gain, 1)
+        self.assertEqual(r.stats.streak, 3)
+
+    def test_page_urls_debug_listing(self):
+        html = """<script>var a="plugin.php?id=ugreen_checkin&amp;ac=ajax";
+        fetch('/api/checkin/sign?day=1');</script>"""
+        urls = m._page_urls(html)
+        self.assertTrue(any("plugin.php" in u for u in urls))
+        self.assertTrue(any("/api/checkin/sign" in u for u in urls))
 
     def test_credit_confirms_today_detects_record(self):
         cfg = m.Config(cookies=[VALID_COOKIE])

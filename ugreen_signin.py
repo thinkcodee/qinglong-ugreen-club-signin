@@ -7,8 +7,9 @@
 原插件依赖 MoviePilot V3 的 Playwright 浏览器点击；青龙容器里通常没有浏览器，
 因此本脚本默认改为「Cookie + HTTP 直连」：
 
-    拉取签到页 → 识别登录/已签到/可签到 → 自动探测签到提交端点
-    → 提交 → 重新拉页复核已签到状态（含积分流水兜底）→ 读取积分页 → 通知
+    拉取签到页 → 用积分页当天签到流水前置确认状态
+    ├─ 已签到 → 直接读积分与连续天数（一个签到请求都不发）
+    └─ 未签到 → 探测端点 → 提交 → 复核（含积分流水兜底）→ 读积分 → 通知
 
 保留原插件的三个关键约定：
   1. 不把「请求发出」或「按钮变化」当成功，必须复核持久化状态；
@@ -403,6 +404,20 @@ def parse_credit_text(text: str, today: Optional[str] = None) -> Stats:
     )
 
 
+def _page_urls(src: str) -> List[str]:
+    """DEBUG 用：列出页面里所有 php / api 地址（含探测时被过滤掉的），便于抓包定位。"""
+    out: List[str] = []
+    for pat in (
+        r"""["']((?:https?://club\.ugnas\.com)?/?[a-z0-9_.]+\.php\?[^"'<>\s]{4,300})["']""",
+        r"""["']((?:https?://club\.ugnas\.com)?/api/[^"'<>\s]{4,300})["']""",
+    ):
+        for m in re.finditer(pat, src or "", re.I):
+            u = html_lib.unescape(m.group(1)).replace("\\/", "/")
+            if u not in out:
+                out.append(u)
+    return out
+
+
 def _form_fields(inner: str) -> Dict[str, str]:
     """提取 form 内所有具名控件，而不只是 hidden。
 
@@ -487,24 +502,24 @@ def discover_targets(page: Page, cfg: Config) -> List[Target]:
             url += ("&" if "?" in url else "?") + "formhash=" + fh
         targets.append(Target(url, cfg.method or "GET", {}, "按钮链接"))
 
-    # 4) 按钮附近的 JS / AJAX URL（Discuz 常用 ajaxget / fetch / $.get）
-    idx = src.find("立即签到")
-    window = src[max(0, idx - 3000): idx + 3000] if idx >= 0 else src[:6000]
+    # 4) 页面里的 JS / AJAX URL（全页扫描：接口可能写在页尾脚本或独立 block）
     found: List[str] = []
     for pat in (
         r"""["']((?:https?://club\.ugnas\.com/)?/?plugin\.php\?[^"'<>\s]{6,300})["']""",
-        r"""["']((?:https?://club\.ugnas\.com/)?/?[a-z_]+\.php\?[^"'<>\s]{6,300})["']""",
+        r"""["']((?:https?://club\.ugnas\.com/)?/?[a-z0-9_]+\.php\?[^"'<>\s]{6,300})["']""",
+        r"""["']((?:https?://club\.ugnas\.com)?/api/[^"'<>\s]{4,300})["']""",
     ):
-        for m in re.finditer(pat, window, re.I):
+        for m in re.finditer(pat, src[:200000], re.I):
             u = m.group(1)
             low = u.lower()
-            if "ugreen_checkin" not in low and "checkin" not in low and "sign" not in low:
+            if not any(w in low for w in ("ugreen_checkin", "checkin", "sign", "qiandao")):
                 continue
-            if not any(w in low for w in _SIGN_ACTION_WORDS):
+            # /api/ 路径通常自带动作语义，不要求再命中 sign/ac 等参数词
+            if "/api/" not in low and not any(w in low for w in _SIGN_ACTION_WORDS):
                 continue
             if u not in found:
                 found.append(u)
-    for u in found[:6]:
+    for u in found[:8]:
         url = _abs_url(u)
         if fh and "formhash=" not in url:
             url += ("&" if "?" in url else "?") + "formhash=" + fh
@@ -559,6 +574,7 @@ class UgreenHttp:
             "Cookie": self._cookie_header(),
         })
         self.formhash = ""
+        self._credit_page: Optional[Page] = None
 
     def _cookie_header(self) -> str:
         return "; ".join("{}={}".format(k, v) for k, v in self.jar.items())
@@ -602,12 +618,14 @@ class UgreenHttp:
 
         比页面文案可靠：论坛改版后按钮文字变了也能确认，避免误报失败。
         """
+        self._credit_page = None
         try:
             page = self.fetch(CREDIT_URL, cache_bust=True)
         except Exception as err:
             if self.cfg.debug:
-                log("DEBUG 积分页兜底复核失败：{}".format(err))
+                log("DEBUG 积分页读取失败：{}".format(err))
             return False
+        self._credit_page = page
         day = datetime.now().strftime("%Y-%m-%d")
         short = datetime.now().strftime("%m-%d")
         for line in (page.text or "").splitlines():
@@ -617,14 +635,16 @@ class UgreenHttp:
                 return True
         return False
 
-    def read_stats(self, checkin_page: Page) -> Stats:
+    def read_stats(self, checkin_page: Page, credit_page: Optional[Page] = None) -> Stats:
         stats = Stats()
         try:
             stats.streak = parse_streak(checkin_page.text)
         except Exception:
             pass
         try:
-            credit = self.fetch(CREDIT_URL)
+            # 已签到分支复用前置确认时拉过的积分页，避免重复请求；
+            # 刚提交完则必须重新拉，才能读到签到后的最新积分。
+            credit = credit_page or self.fetch(CREDIT_URL)
             parsed = parse_credit_text(credit.text)
             stats.balance = parsed.balance
             stats.today_gain = parsed.today_gain
@@ -647,14 +667,33 @@ class UgreenHttp:
             log("DEBUG 页面已保存：{}（请勿公开发布，可能含账号昵称）".format(path))
         except Exception as err:
             log("DEBUG 页面保存失败：{}".format(err))
+        # 把页面里出现过的请求地址都列出来，一次运行即可判断真实接口藏在何处
+        urls = _page_urls(page.html or "")
+        if urls:
+            log("DEBUG 页面内共发现 {} 个 php/api 地址：".format(len(urls)))
+            for u in urls[:20]:
+                log("DEBUG   " + u[:180])
+        else:
+            log("DEBUG 页面内没有 php/api 地址，签到请求可能在外部 JS 里，需 F12 抓包")
 
     def run(self, label: str) -> Result:
+        # 1) 先看签到页状态
         page = self.fetch(CHECKIN_URL)
         state = read_state(page)
         self.dump_debug(page, label + " 签到页")
 
         if state == "login":
             raise CookieExpiredError("论坛登录已失效，请更新 Cookie")
+
+        # 2) 前置状态确认：按钮文案可能被缓存或改版，积分页当天的签到流水更可靠。
+        #    已签到就到此为止，一个签到请求都不发。
+        stats_credit: Optional[Page] = None
+        if state != "already" and self.cfg.credit_verify:
+            if self.credit_confirms_today():
+                stats_credit = self._credit_page
+                state = "already"
+                log("{} 积分页显示今日已有签到记录，跳过提交".format(label))
+
         if state == "unknown":
             # 再看一眼首页，区分「Cookie 失效」和「页面结构变化」
             try:
@@ -669,8 +708,12 @@ class UgreenHttp:
 
         extra = ""
         if state == "already":
+            # 3) 已签到：直接读积分与连续天数，不发任何签到请求
             status, message = "already", "今日已签到"
+            log("{} 今日已签到，跳过提交，直接读取积分与连续天数".format(label))
         else:
+            # 4) 确认未签到才提交
+            log("{} 今日尚未签到，开始尝试签到".format(label))
             targets = discover_targets(page, self.cfg)
             log("{} 共探测到 {} 个候选签到端点（formhash：{}）".format(
                 label, len(targets), "已获取" if page.formhash else "未获取"))
@@ -704,6 +747,7 @@ class UgreenHttp:
                 if self.credit_confirms_today():
                     status, message = "success", "签到成功"
                     extra = "提交方式：积分记录确认（页面文案未变化）"
+                    stats_credit = self._credit_page
                     if last_after is not None:
                         page = last_after
                     log("{} 复核通过：积分页出现当日签到记录".format(label))
@@ -713,7 +757,8 @@ class UgreenHttp:
                     log("{} DEBUG 最后一次复核页文本：{}".format(label, snippet or "(空)"))
                 raise CheckinError("提交后未确认签到成功，请抓包配置 UGREEN_SIGNIN_SUBMIT_URL 或改用 browser 模式")
 
-        stats = self.read_stats(page)
+        # 5) 统一读积分信息；已签到分支复用前置确认时拉过的积分页
+        stats = self.read_stats(page, credit_page=stats_credit)
         return Result(label, status, message, stats, _now(), extra)
 
 
