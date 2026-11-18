@@ -410,6 +410,270 @@ class TestFlow(unittest.TestCase):
         self.assertFalse(cfg.notify)
 
 
+# ---------------------------------------------------------------- browser 模式
+# 用假的 playwright 模块驱动真实 run_browser 流程，不联网、不需要 chromium。
+
+class _FakeForum:
+    """模拟论坛服务端状态：页面文案、积分流水、接口响应。"""
+
+    def __init__(self, signed=False, login=False, credit_signed=None,
+                 evaluate_fails=False, fetch_status=200, never_sign=False,
+                 credit_signed_after_submit=False):
+        self.signed = signed
+        self.login = login
+        self.credit_signed = credit_signed
+        self.evaluate_fails = evaluate_fails
+        self.fetch_status = fetch_status
+        self.never_sign = never_sign
+        self.credit_signed_after_submit = credit_signed_after_submit
+        self.fetches = []
+        self.clicks = []
+        self.current = m.CHECKIN_URL
+
+    def html_for(self, url):
+        if self.login:
+            return LOGIN_HTML
+        if "ac=credit" in url:
+            if self.credit_signed_after_submit and (self.fetches or self.clicks):
+                return CREDIT_HTML
+            show = self.credit_signed if self.credit_signed is not None else self.signed
+            return CREDIT_HTML if show else CREDIT_EMPTY_HTML
+        return ALREADY_HTML if self.signed else READY_HTML
+
+
+class _FakeLocator:
+    def __init__(self, forum, selector):
+        self.forum = forum
+        self.selector = selector
+
+    @property
+    def first(self):
+        return self
+
+    def click(self, timeout=None):
+        self.forum.clicks.append(self.selector)
+        if not self.forum.never_sign:
+            self.forum.signed = True
+
+
+class _FakePage:
+    def __init__(self, forum):
+        self.forum = forum
+        self.url = forum.current
+
+    def set_default_timeout(self, ms):
+        pass
+
+    def set_default_navigation_timeout(self, ms):
+        pass
+
+    def goto(self, url, **kwargs):
+        self.forum.current = url
+        self.url = url
+
+    def content(self):
+        return self.forum.html_for(self.forum.current or self.url)
+
+    def reload(self, **kwargs):
+        pass
+
+    def evaluate(self, js, arg=None):
+        if self.forum.evaluate_fails:
+            raise RuntimeError("fetch blocked")
+        self.forum.fetches.append(arg or {})
+        if not self.forum.never_sign:
+            self.forum.signed = True
+        return {"status": self.forum.fetch_status, "text": "签到成功"}
+
+    def locator(self, selector):
+        return _FakeLocator(self.forum, selector)
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def wait_for_function(self, *args, **kwargs):
+        pass
+
+
+class _FakeContext:
+    def __init__(self, forum):
+        self.forum = forum
+        self.page = _FakePage(forum)
+
+    def add_cookies(self, cookies):
+        self.forum.cookies = cookies
+
+    def new_page(self):
+        return self.page
+
+
+class _FakeBrowser:
+    def __init__(self, forum):
+        self.forum = forum
+
+    def new_context(self, **kwargs):
+        return _FakeContext(self.forum)
+
+
+class _FakeChromium:
+    def __init__(self, forum):
+        self.forum = forum
+
+    def launch(self, **kwargs):
+        return _FakeBrowser(self.forum)
+
+
+class _FakePlaywright:
+    def __init__(self, forum):
+        self.forum = forum
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    @property
+    def chromium(self):
+        return _FakeChromium(self.forum)
+
+
+def _install_fake_playwright(forum):
+    pkg = types.ModuleType("playwright")
+    sync = types.ModuleType("playwright.sync_api")
+    sync.sync_playwright = lambda: _FakePlaywright(forum)
+    pkg.sync_api = sync
+    return {"playwright": pkg, "playwright.sync_api": sync}
+
+
+class TestBrowserMode(unittest.TestCase):
+    def _run(self, forum, **cfgkw):
+        cfg = m.Config(cookies=[VALID_COOKIE], mode="browser", **cfgkw)
+        with patch.dict(sys.modules, _install_fake_playwright(forum)):
+            return m.run_browser(VALID_COOKIE, cfg, "账号1")
+
+    def test_shared_helpers(self):
+        t = m.official_submit("abc123def")
+        self.assertEqual(t.method, "POST")
+        self.assertEqual(t.data, {"checkinsubmit": "yes", "formhash": "abc123def"})
+        g = m.official_submit("abc123def", "GET")
+        self.assertIn("formhash=abc123def", g.url)
+        self.assertEqual(g.data, {})
+        self.assertTrue(m.credit_text_confirms_today(m.html_to_text(CREDIT_HTML)))
+        self.assertFalse(m.credit_text_confirms_today(m.html_to_text(CREDIT_EMPTY_HTML)))
+
+    def test_official_endpoint_in_browser(self):
+        forum = _FakeForum()
+        r = self._run(forum)
+        self.assertEqual(r.status, "success")
+        self.assertIn("官方接口", r.extra)
+        self.assertEqual(len(forum.fetches), 1)
+        arg = forum.fetches[0]
+        self.assertEqual(arg["method"], "POST")
+        self.assertIn("action=sign", arg["url"])
+        self.assertIn("checkinsubmit=yes", arg["body"])
+        self.assertIn("formhash=abc123def", arg["body"])
+        self.assertEqual(forum.clicks, [], "接口成功时不应再点按钮")
+        self.assertEqual(r.stats.balance, 78)
+        self.assertEqual(r.stats.today_gain, 1)
+        self.assertEqual(r.stats.streak, 4, "连续天数来自复核后的页面")
+
+    def test_already_no_submit(self):
+        forum = _FakeForum(signed=True)
+        r = self._run(forum)
+        self.assertEqual(r.status, "already")
+        self.assertEqual(forum.fetches, [])
+        self.assertEqual(forum.clicks, [])
+
+    def test_precheck_skips_submit(self):
+        forum = _FakeForum(credit_signed=True, never_sign=True)
+        r = self._run(forum)
+        self.assertEqual(r.status, "already")
+        self.assertEqual(forum.fetches, [])
+        self.assertEqual(forum.clicks, [])
+        self.assertEqual(r.stats.balance, 78)
+
+    def test_falls_back_to_click_when_fetch_fails(self):
+        forum = _FakeForum(evaluate_fails=True)
+        r = self._run(forum)
+        self.assertEqual(r.status, "success")
+        self.assertIn("点击按钮", r.extra)
+        self.assertTrue(forum.clicks)
+
+    def test_falls_back_to_click_on_non_2xx(self):
+        forum = _FakeForum(fetch_status=404)
+        r = self._run(forum)
+        self.assertEqual(r.status, "success")
+        self.assertTrue(forum.clicks)
+
+    def test_credit_fallback_confirms(self):
+        forum = _FakeForum(never_sign=True, credit_signed_after_submit=True)
+        r = self._run(forum)
+        self.assertEqual(r.status, "success")
+        self.assertIn("积分记录确认", r.extra)
+        self.assertEqual(forum.clicks, [])
+
+    def test_not_confirmed_raises(self):
+        forum = _FakeForum(never_sign=True)
+        with self.assertRaises(m.CheckinError) as ctx:
+            self._run(forum)
+        self.assertIn("未确认签到成功", str(ctx.exception))
+
+    def test_login_expired(self):
+        with self.assertRaises(m.CookieExpiredError):
+            self._run(_FakeForum(login=True))
+
+    def test_manual_endpoint_respected(self):
+        forum = _FakeForum()
+        cfg = m.Config(
+            cookies=[VALID_COOKIE], mode="browser", method="POST",
+            submit_url="plugin.php?id=ugreen_checkin&ac=custom&formhash={formhash}",
+            submit_body="x=1",
+        )
+        with patch.dict(sys.modules, _install_fake_playwright(forum)):
+            r = m.run_browser(VALID_COOKIE, cfg, "账号1")
+        self.assertEqual(r.status, "success")
+        self.assertIn("ac=custom", forum.fetches[0]["url"])
+        self.assertEqual(forum.fetches[0]["body"], "x=1")
+
+    def test_missing_playwright(self):
+        with patch.dict(sys.modules, {"playwright": None, "playwright.sync_api": None}):
+            with self.assertRaises(m.CheckinError) as ctx:
+                m.run_browser(VALID_COOKIE, m.Config(cookies=[VALID_COOKIE], mode="browser"), "账号1")
+        self.assertIn("playwright", str(ctx.exception))
+
+    def test_missing_chromium_gives_install_hint(self):
+        class _BrokenChromium(_FakeChromium):
+            def launch(self, **kwargs):
+                raise RuntimeError(
+                    "Executable doesn't exist at /root/.cache/ms-playwright/chrome ... "
+                    "Please run: playwright install chromium"
+                )
+
+        class _PW(_FakePlaywright):
+            @property
+            def chromium(self):
+                return _BrokenChromium(self.forum)
+
+        forum = _FakeForum()
+        pkg = types.ModuleType("playwright")
+        sync = types.ModuleType("playwright.sync_api")
+        sync.sync_playwright = lambda: _PW(forum)
+        pkg.sync_api = sync
+        with patch.dict(sys.modules, {"playwright": pkg, "playwright.sync_api": sync}):
+            with self.assertRaises(m.CheckinError) as ctx:
+                m.run_browser(VALID_COOKIE, m.Config(cookies=[VALID_COOKIE], mode="browser"), "账号1")
+        self.assertIn("playwright install chromium", str(ctx.exception))
+
+    def test_via_run_account(self):
+        forum = _FakeForum()
+        cfg = m.Config(cookies=[VALID_COOKIE], mode="browser")
+        with patch.dict(sys.modules, _install_fake_playwright(forum)):
+            r = m.run_account(VALID_COOKIE, cfg, "账号1")
+        self.assertEqual(r.status, "success")
+        self.assertIn("browser", r.extra)
+
+
 class TestNotification(unittest.TestCase):
     def test_success_text(self):
         r = m.Result("账号1", "success", "签到成功", m.Stats(78, 1, 3, 3), "2026-11-16 08:00:12")

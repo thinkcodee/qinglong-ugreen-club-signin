@@ -27,8 +27,9 @@
 operation=qiandao 候选，仅在官方接口改版失效时兜底；页面文案没变时再用积分页
 当天的签到流水做二次确认，避免论坛改版后误报失败。
 
-可选 UGREEN_SIGNIN_MODE=browser 走 Playwright 模式，逻辑与原插件一致（需自行安装
-playwright + chromium），用于 HTTP 自动探测失效时兜底。
+可选 UGREEN_SIGNIN_MODE=browser 走 Playwright 模式（需自行安装 playwright + chromium）：
+在已登录的浏览器会话里发同源 fetch 提交同一个官方接口，接口失败再降级为点击按钮；
+状态判定、积分流水复核、积分解析与 http 模式完全共用。
 
 环境变量见 README.md。日志与异常信息中永不打印 Cookie。
 """
@@ -469,6 +470,67 @@ def _form_fields(inner: str) -> Dict[str, str]:
     return fields
 
 
+def dump_page_debug(html: str, label: str, cfg: Config) -> None:
+    """DEBUG 时保存页面并列出其中的 php/api 地址（http / browser 共用）。
+
+    页面可能含账号昵称，仅写本地文件，绝不打印 Cookie。
+    """
+    if not cfg.debug:
+        return
+    try:
+        path = env("UGREEN_SIGNIN_DEBUG_FILE") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "ugreen_signin_debug.html"
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("<h2>{}</h2><pre>".format(label))
+            f.write(html_lib.escape(html[:200000]))
+            f.write("</pre>")
+        log("DEBUG 页面已保存：{}（请勿公开发布，可能含账号昵称）".format(path))
+    except Exception as err:
+        log("DEBUG 页面保存失败：{}".format(err))
+    urls = _page_urls(html or "")
+    if urls:
+        log("DEBUG 页面内共发现 {} 个 php/api 地址：".format(len(urls)))
+        for u in urls[:20]:
+            log("DEBUG   " + u[:180])
+    else:
+        log("DEBUG 页面内没有 php/api 地址，签到请求可能在外部 JS 里，需 F12 抓包")
+
+
+def official_submit(formhash: str, method: str = "POST") -> Target:
+    """构造抓包确认的官方签到请求，供 http / browser 两种模式共用。
+
+    POST 时 formhash 只在表单体里；强制 GET 时才移到 URL（不推荐）。
+    """
+    verb = (method or "POST").upper()
+    if verb not in ("GET", "POST"):
+        verb = "POST"
+    url = _abs_url(OFFICIAL_SUBMIT_PATH)
+    data: Dict[str, str] = {}
+    if verb == "POST":
+        data = dict(OFFICIAL_FORM)
+        if formhash:
+            data["formhash"] = formhash
+    elif formhash:
+        url += ("&" if "?" in url else "?") + "formhash=" + formhash
+    return Target(url, verb, data, "官方接口")
+
+
+def credit_text_confirms_today(text: str) -> bool:
+    """积分页出现「当天 + 签到 + 积分」记录 = 签到已落库。
+
+    比页面按钮文案可靠：论坛改版后按钮文字变了也能确认，避免误报失败。
+    """
+    day = datetime.now().strftime("%Y-%m-%d")
+    short = datetime.now().strftime("%m-%d")
+    for line in (text or "").splitlines():
+        if "签到" not in line or (day not in line and short not in line):
+            continue
+        if re.search(r"[+\-]\s*[0-9]|[0-9]\s*积分|积分\s*[+\-]", line):
+            return True
+    return False
+
+
 def discover_targets(page: Page, cfg: Config) -> List[Target]:
     """从签到页还原「立即签到」按钮背后的提交请求。
 
@@ -495,17 +557,7 @@ def discover_targets(page: Page, cfg: Config) -> List[Target]:
 
     # 2) 抓包确认的官方接口：默认首选，零配置即可命中。
     #    strict 只关「猜测候选」，官方接口始终保留；提交后仍会重新拉页复核。
-    official_method = cfg.method or "POST"
-    official_url = _abs_url(OFFICIAL_SUBMIT_PATH)
-    official_data: Dict[str, str] = {}
-    if official_method == "POST":
-        official_data = dict(OFFICIAL_FORM)
-        if fh:
-            official_data["formhash"] = fh
-    elif fh:
-        # 用户强制 GET 时把 formhash 移到 URL（不推荐，仅作兼容）
-        official_url += ("&" if "?" in official_url else "?") + "formhash=" + fh
-    targets.append(Target(official_url, official_method, official_data, "官方接口"))
+    targets.append(official_submit(fh, cfg.method or "POST"))
 
     # 3) 按钮所在的 <form>
     for m in re.finditer(r"<form\b([^>]*)>(.*?)</form>", src, re.I | re.S):
@@ -652,10 +704,7 @@ class UgreenHttp:
         return text
 
     def credit_confirms_today(self) -> bool:
-        """积分页出现「当天 + 签到 + 积分」记录 = 签到已落库。
-
-        比页面文案可靠：论坛改版后按钮文字变了也能确认，避免误报失败。
-        """
+        """拉一次积分页，用当天签到流水确认签到已落库。"""
         self._credit_page = None
         try:
             page = self.fetch(CREDIT_URL, cache_bust=True)
@@ -664,14 +713,7 @@ class UgreenHttp:
                 log("DEBUG 积分页读取失败：{}".format(err))
             return False
         self._credit_page = page
-        day = datetime.now().strftime("%Y-%m-%d")
-        short = datetime.now().strftime("%m-%d")
-        for line in (page.text or "").splitlines():
-            if "签到" not in line or (day not in line and short not in line):
-                continue
-            if re.search(r"[+\-]\s*[0-9]|[0-9]\s*积分|积分\s*[+\-]", line):
-                return True
-        return False
+        return credit_text_confirms_today(page.text)
 
     def read_stats(self, checkin_page: Page, credit_page: Optional[Page] = None) -> Stats:
         stats = Stats()
@@ -692,27 +734,7 @@ class UgreenHttp:
         return stats
 
     def dump_debug(self, page: Page, label: str) -> None:
-        if not self.cfg.debug:
-            return
-        try:
-            path = env("UGREEN_SIGNIN_DEBUG_FILE") or os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "ugreen_signin_debug.html"
-            )
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("<h2>{}</h2><pre>".format(label))
-                f.write(html_lib.escape(page.html[:200000]))
-                f.write("</pre>")
-            log("DEBUG 页面已保存：{}（请勿公开发布，可能含账号昵称）".format(path))
-        except Exception as err:
-            log("DEBUG 页面保存失败：{}".format(err))
-        # 把页面里出现过的请求地址都列出来，一次运行即可判断真实接口藏在何处
-        urls = _page_urls(page.html or "")
-        if urls:
-            log("DEBUG 页面内共发现 {} 个 php/api 地址：".format(len(urls)))
-            for u in urls[:20]:
-                log("DEBUG   " + u[:180])
-        else:
-            log("DEBUG 页面内没有 php/api 地址，签到请求可能在外部 JS 里，需 F12 抓包")
+        dump_page_debug(page.html, label, self.cfg)
 
     def run(self, label: str) -> Result:
         # 1) 先看签到页状态
@@ -804,8 +826,39 @@ class UgreenHttp:
         return Result(label, status, message, stats, _now(), extra)
 
 
+# 浏览器上下文里直接提交签到接口：同源 fetch 会自动带登录 Cookie / Origin /
+# Referer，比手动拼请求头更贴近真实点击，也不依赖任何按钮选择器。
+_BROWSER_FETCH_JS = """async ({url, method, body}) => {
+  const opt = {
+    method: method,
+    credentials: 'same-origin',
+    headers: {'X-Requested-With': 'XMLHttpRequest', 'Accept': '*/*'}
+  };
+  if (method === 'POST') {
+    opt.headers['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8';
+    opt.body = body;
+  }
+  const resp = await fetch(url, opt);
+  const text = await resp.text();
+  return {status: resp.status, text: text.slice(0, 500)};
+}"""
+
+_BROWSER_CLICK_SELECTORS = (
+    'button:has-text("立即签到")',
+    'a:has-text("立即签到")',
+    '[role="button"]:has-text("立即签到")',
+    'text=立即签到',
+)
+
+
 def run_browser(raw_cookie: str, cfg: Config, label: str) -> Result:
-    """可选：Playwright 模式，流程与 MoviePilot 原插件一致。需自行安装 playwright + chromium。"""
+    """Playwright 模式：在已登录的浏览器会话里提交抓包确认的官方接口。
+
+    与 http 模式共用 discover_targets 的端点优先级、状态判定、积分流水复核
+    和积分解析；浏览器只提供登录上下文（Cookie / Origin / Referer 自动携带）。
+    接口提交失败时降级为点击「立即签到」按钮。两种情况都必须重新加载页面
+    复核持久化状态，不把「请求已发出」当成功。
+    """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -818,7 +871,7 @@ def run_browser(raw_cookie: str, cfg: Config, label: str) -> Result:
     ]
     timeout_ms = cfg.browser_timeout * 1000
     try:
-        # sync_playwright 的上下文退出时会自动关闭 browser/context，无需额外 finally
+        # sync_playwright 的上下文退出时会自动关闭 browser/context
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             context = browser.new_context(user_agent=cfg.ua, viewport={"width": 1280, "height": 900})
@@ -826,66 +879,152 @@ def run_browser(raw_cookie: str, cfg: Config, label: str) -> Result:
             page = context.new_page()
             page.set_default_timeout(timeout_ms)
             page.set_default_navigation_timeout(timeout_ms)
-            page.goto(CHECKIN_URL, wait_until="domcontentloaded", timeout=timeout_ms)
 
             def snapshot() -> Page:
-                try:
-                    text = str(page.locator("body").inner_text(timeout=5000) or "")
-                except Exception:
-                    text = html_to_text(page.content())
+                # 统一走 html_to_text，与 http 模式共用全部解析规则
                 raw = ""
                 try:
                     raw = page.content()
                 except Exception:
                     pass
-                return Page(str(page.url or ""), raw, text, extract_formhash(raw))
+                return Page(str(page.url or ""), raw, html_to_text(raw), extract_formhash(raw))
 
-            cur = snapshot()
+            def goto(url: str) -> Page:
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                return snapshot()
+
+            cur = goto(CHECKIN_URL)
+            dump_page_debug(cur.html, label + " 签到页(browser)", cfg)
             state = read_state(cur)
             if state == "login":
                 raise CookieExpiredError("论坛登录已失效，请更新 Cookie")
             if state == "unknown":
                 raise CheckinError("未识别到签到按钮，论坛页面结构可能已变化")
 
-            if state == "ready":
-                page.locator('button:has-text("立即签到")').first.click(timeout=timeout_ms)
+            # 前置确认：积分页当天签到流水比按钮文案可靠
+            credit: Optional[Page] = None
+            if state != "already" and cfg.credit_verify:
                 try:
-                    page.wait_for_function(
-                        "() => { const t = document.body ? document.body.innerText : ''; "
-                        "return t.includes('今日已签到') || t.includes('签到成功'); }",
-                        timeout=timeout_ms,
-                    )
-                except Exception:
-                    pass
+                    credit = goto(CREDIT_URL)
+                    if credit_text_confirms_today(credit.text):
+                        state = "already"
+                        log("{} 积分页显示今日已有签到记录，跳过提交".format(label))
+                except Exception as err:
+                    if cfg.debug:
+                        log("DEBUG browser 积分页读取失败：{}".format(err))
+                cur = goto(CHECKIN_URL)
+
+            extra = "browser 模式"
+            status, message = "", ""
+            pending_verify = False
+
+            if state == "already":
+                status, message = "already", "今日已签到"
+                log("{} 今日已签到，跳过提交，直接读取积分与连续天数".format(label))
+            else:
+                log("{} 今日尚未签到，开始尝试签到（browser）".format(label))
+                # 必须回到签到页：同源 fetch 需要正确的 Referer / Origin，
+                # formhash 也要取本次页面的最新值。
+                cur = goto(CHECKIN_URL)
+                targets = discover_targets(cur, cfg)
+                target = targets[0] if targets else official_submit(cur.formhash, "POST")
+                log("{} 选用端点：{} · {}（formhash：{}）".format(
+                    label, target.origin, target.method,
+                    "已获取" if cur.formhash else "未获取"))
+                if cfg.debug:
+                    log("DEBUG browser 提交地址：{}".format(target.url[:180]))
+                body = urllib.parse.urlencode(target.data)
+                submitted = False
+                try:
+                    reply = page.evaluate(_BROWSER_FETCH_JS, {
+                        "url": target.url, "method": target.method, "body": body,
+                    }) or {}
+                    code = int(reply.get("status", 0) or 0)
+                    if cfg.debug:
+                        snippet = re.sub(r"\s+", " ", str(reply.get("text", ""))).strip()[:160] or "(空响应)"
+                        log("DEBUG browser 提交 {} -> HTTP {} | {}".format(target.method, code, snippet))
+                    if 200 <= code < 400:
+                        submitted = True
+                        extra = "browser 模式 · {}".format(target.origin)
+                        log("{} 已提交签到请求（{}）".format(label, target.origin))
+                    elif cfg.debug:
+                        log("DEBUG browser 接口返回非成功状态，回退点击按钮")
+                except Exception as err:
+                    log("{} 接口提交失败，回退点击按钮：{}".format(label, err))
+
+                if not submitted:
+                    clicked = False
+                    for sel in _BROWSER_CLICK_SELECTORS:
+                        try:
+                            page.locator(sel).first.click(timeout=min(timeout_ms, 10000))
+                            clicked = True
+                            break
+                        except Exception:
+                            continue
+                    if not clicked:
+                        raise CheckinError("接口未提交成功，且未找到「立即签到」按钮")
+                    extra = "browser 模式 · 点击按钮"
+                    try:
+                        page.wait_for_timeout(1000)  # 等按钮触发的 AJAX 落库
+                    except Exception:
+                        pass
+                    log("{} 已点击「立即签到」按钮".format(label))
+
+                # 复核持久化状态
                 page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
                 cur = snapshot()
-                if read_state(cur) == "login":
+                after_state = read_state(cur)
+                if after_state == "login":
                     raise CookieExpiredError("签到过程中登录失效，请更新 Cookie")
-                if read_state(cur) != "already":
-                    raise CheckinError("点击后未确认签到成功，请稍后重试或检查 Cookie")
-                status, message = "success", "签到成功"
-            else:
-                status, message = "already", "今日已签到"
+                if after_state == "already":
+                    status, message = "success", "签到成功"
+                    log("{} 复核通过：今日已签到（{}）".format(label, extra))
+                else:
+                    pending_verify = cfg.credit_verify
+                    if cfg.debug:
+                        log("{} DEBUG 复核页状态 {}，改用积分流水确认".format(label, after_state))
+
+            # 统一读积分：只要提交过就必须重拉，已签到可复用前置积分页
+            if status == "success" or pending_verify:
+                credit = None
+            credit_text = ""
+            try:
+                credit = credit or goto(CREDIT_URL)
+                credit_text = credit.text
+            except Exception as err:
+                if cfg.debug:
+                    log("DEBUG browser 积分页读取失败：{}".format(err))
+
+            if pending_verify:
+                if credit_text_confirms_today(credit_text):
+                    status, message = "success", "签到成功"
+                    extra += " · 积分记录确认"
+                    log("{} 复核通过：积分页出现当日签到记录".format(label))
+                else:
+                    raise CheckinError("提交后未确认签到成功，可开 DEBUG 或改用 http 模式排查")
 
             stats = Stats()
             try:
                 stats.streak = parse_streak(cur.text)
-            except Exception:
-                pass
-            try:
-                page.goto(CREDIT_URL, wait_until="domcontentloaded", timeout=timeout_ms)
-                credit = snapshot()
-                parsed = parse_credit_text(credit.text)
+                parsed = parse_credit_text(credit_text)
                 stats.balance = parsed.balance
                 stats.today_gain = parsed.today_gain
                 stats.today_total = parsed.today_total
             except Exception:
                 pass
-            return Result(label, status, message, stats, _now(), "browser 模式")
+            return Result(label, status, message, stats, _now(), extra)
     except (CookieExpiredError, CheckinError):
         raise
     except Exception as err:
-        raise CheckinError("浏览器签到异常：{}".format(err))
+        msg = str(err)
+        low = msg.lower()
+        if "executable doesn't exist" in low or "playwright install" in low:
+            raise CheckinError(
+                "浏览器启动失败：未下载 chromium。请在青龙执行 "
+                "playwright install chromium（缺系统库时再执行 playwright install-deps chromium）。"
+                "原始错误：{}".format(msg[:200])
+            )
+        raise CheckinError("浏览器签到异常：{}".format(msg))
 
 
 def run_account(raw_cookie: str, cfg: Config, label: str) -> Result:
