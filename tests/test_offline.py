@@ -103,11 +103,13 @@ class ScriptedClient(m.UgreenHttp):
         # 模拟「提交之后积分流水才出现」：用于验证提交后的兜底复核
         self.credit_signed_after_submit = credit_signed_after_submit
         self.submits = []
+        self.submit_headers = []
 
     def _get(self, url, **kwargs):
         return self._reply(url, "GET")
 
     def _post(self, url, data=None, **kwargs):
+        self.submit_headers.append(kwargs.get("headers") or {})
         return self._reply(url, "POST", data)
 
     def _reply(self, url, method, data=None):
@@ -123,7 +125,7 @@ class ScriptedClient(m.UgreenHttp):
         if "_t=" in query:  # 复核请求
             return _Resp(ALREADY_HTML if self.signed else READY_HTML, url)
         is_submit = any(k in query for k in (
-            "ac=sign", "do=sign", "op=sign", "action=checkin",
+            "ac=sign", "do=sign", "op=sign", "action=sign", "action=checkin",
             "signsubmit", "ugreen_checkin:sign", "ac=do_sign", "ac=do",
             "operation=qiandao",
         ))
@@ -189,12 +191,39 @@ class TestParsing(unittest.TestCase):
         # 按钮还在，别处的「签到成功」提示不能算已签到
         html2 = "<div>上次签到成功</div><button>立即签到</button>"
         self.assertEqual(m.read_state(_page(html2)), "ready")
+        # 绿联自绘页未签到文案：即使按钮文字改版也能识别
+        self.assertEqual(m.read_state(_page("<div>今天还没有签到</div>")), "ready")
         # 论坛改版后可自定义已签到文案
         with patch.dict(os.environ, {"UGREEN_SIGNIN_ALREADY_KEYWORDS": "今日已打卡,明天见"}, clear=True):
             self.assertEqual(m.read_state(_page("<div>今日已打卡</div>")), "already")
 
 
 class TestDiscover(unittest.TestCase):
+    def test_official_endpoint_is_first(self):
+        """抓包确认的官方接口必须是默认首选，且 formhash 只在表单体里。"""
+        cfg = m.Config(cookies=[VALID_COOKIE])
+        targets = m.discover_targets(_page(READY_HTML), cfg)
+        t = targets[0]
+        self.assertEqual(t.origin, "官方接口")
+        self.assertEqual(t.method, "POST")
+        self.assertEqual(t.url, "https://club.ugnas.com/plugin.php?id=ugreen_checkin&action=sign")
+        self.assertEqual(t.data["checkinsubmit"], "yes")
+        self.assertEqual(t.data["formhash"], "abc123def")
+        self.assertNotIn("formhash", t.url, "抓包确认 formhash 只在 POST 表单体里")
+
+    def test_official_endpoint_survives_strict(self):
+        cfg = m.Config(cookies=[VALID_COOKIE], strict=True)
+        targets = m.discover_targets(_page(READY_HTML), cfg)
+        self.assertTrue(any(t.origin == "官方接口" for t in targets))
+        self.assertFalse(any(t.origin == "候选接口" for t in targets))
+
+    def test_official_endpoint_can_be_forced_get(self):
+        cfg = m.Config(cookies=[VALID_COOKIE], method="GET", strict=True)
+        t = m.discover_targets(_page(READY_HTML), cfg)[0]
+        self.assertEqual(t.method, "GET")
+        self.assertIn("formhash=abc123def", t.url)
+        self.assertEqual(t.data, {})
+
     def test_form(self):
         cfg = m.Config(cookies=[VALID_COOKIE])
         targets = m.discover_targets(_page(FORM_HTML), cfg)
@@ -225,7 +254,8 @@ class TestDiscover(unittest.TestCase):
             submit_body="qdxq=1&todaysay=hi", method="POST",
         )
         targets = m.discover_targets(_page(READY_HTML), cfg)
-        self.assertEqual(len(targets), 1)
+        self.assertEqual(len(targets), 1, "手动指定应独占端点列表")
+        self.assertEqual(targets[0].origin, "手动指定")
         self.assertEqual(targets[0].method, "POST")
         self.assertIn("formhash=abc123def", targets[0].url)
         self.assertEqual(targets[0].data["qdxq"], "1")
@@ -276,8 +306,22 @@ class TestFlow(unittest.TestCase):
         self.assertEqual(r.stats.balance, 78)
         self.assertEqual(r.stats.today_gain, 1)
         self.assertEqual(r.stats.streak, 4, "连续天数必须来自签到后的复核页")
-        self.assertTrue(client.submits, "应发出过签到提交")
-        self.assertIn("候选接口", r.extra)
+        self.assertEqual(len(client.submits), 1, "官方接口应第一个命中，不再盲试猜测端点")
+        self.assertEqual(client.submits[0][0], "POST")
+        self.assertIn("action=sign", client.submits[0][1])
+        self.assertIn("官方接口", r.extra)
+
+    def test_official_submit_headers(self):
+        """提交头需复刻抓包：AJAX / Origin / 表单编码。"""
+        cfg = m.Config(cookies=[VALID_COOKIE], strict=True)
+        client = ScriptedClient(cfg)
+        client.run("账号1")
+        self.assertTrue(client.submit_headers)
+        h = client.submit_headers[0]
+        self.assertEqual(h.get("X-Requested-With"), "XMLHttpRequest")
+        self.assertEqual(h.get("Origin"), "https://club.ugnas.com")
+        self.assertEqual(h.get("Referer"), m.CHECKIN_URL)
+        self.assertIn("application/x-www-form-urlencoded", h.get("Content-Type", ""))
 
     def test_already_no_submit(self):
         cfg = m.Config(cookies=[VALID_COOKIE])

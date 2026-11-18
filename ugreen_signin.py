@@ -16,8 +16,15 @@
   2. 明确区分 Cookie 失效、页面结构变化、签到失败；
   3. 通知文案按原插件的人话排版，顺带读出积分余额、今日积分、连续天数。
 
-探测覆盖 Discuz「每日签到」(dsu_paulsign) 系的 operation=qiandao POST/GET 形态，
-表单探测会带上提交按钮、单选、下拉等具名控件；页面文案没变时再用积分页
+签到提交接口已按 F12 抓包确认，作为默认首选端点（零配置即可命中）：
+
+    POST https://club.ugnas.com/plugin.php?id=ugreen_checkin&action=sign
+    Content-Type: application/x-www-form-urlencoded; charset=UTF-8
+    X-Requested-With: XMLHttpRequest
+    body: checkinsubmit=yes&formhash=<从签到页实时提取>
+
+页面表单 / 按钮链接 / JS 地址探测，以及 Discuz「每日签到」(dsu_paulsign) 系的
+operation=qiandao 候选，仅在官方接口改版失效时兜底；页面文案没变时再用积分页
 当天的签到流水做二次确认，避免论坛改版后误报失败。
 
 可选 UGREEN_SIGNIN_MODE=browser 走 Playwright 模式，逻辑与原插件一致（需自行安装
@@ -66,9 +73,13 @@ _CREDIT_ROW_RE = re.compile(
     r"(?P<detail>.*?)\s+(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})\s+[0-9]{2}:[0-9]{2}$"
 )
 
-# Discuz「每日签到」系插件（DSU/dsu_paulsign）的真实提交形态：
-# operation=qiandao + 心情/快捷回复等表单参数，且常为 POST。
-# 绿联的 ugreen_checkin 很可能是同系定制，因此优先尝试，命中仍需复核。
+# 抓包确认的官方签到接口（F12 → Network → 点击「立即签到」）。
+# 注意：formhash 只在表单体里、URL 上不带；它由脚本从签到页实时提取，
+# 不能写死（每次登录会话都不同）。下面只记录接口形态，不含任何账号凭据。
+OFFICIAL_SUBMIT_PATH = "plugin.php?id=ugreen_checkin&action=sign"
+OFFICIAL_FORM = {"checkinsubmit": "yes"}
+
+# Discuz「每日签到」系插件（DSU/dsu_paulsign）的提交形态，仅作官方接口失效后的兜底。
 _CANDIDATE_PATHS = [
     "plugin.php?id=ugreen_checkin:sign&operation=qiandao&inajax=1&infloat=1&qdxq=kx&qdmode=2&todaysay=&fastreply=1&formhash={formhash}",
     "plugin.php?id=ugreen_checkin&operation=qiandao&inajax=1&infloat=1&qdxq=kx&qdmode=2&todaysay=&fastreply=1&formhash={formhash}",
@@ -97,6 +108,8 @@ _DSU_FORM = {"qdxq": "kx", "qdmode": "2", "todaysay": "", "fastreply": "1"}
 # 严格词直接判「已签到」；宽松词仅在「立即签到」按钮消失后生效，避免误报
 _ALREADY_STRICT_WORDS = ("今日已签到", "今天已签到", "今日已签", "您今天已经签到")
 _ALREADY_LOOSE_WORDS = ("已签到", "签到成功", "签到完成", "已经签到", "明日再来", "明天再来")
+# 绿联自绘签到页未签到时写的是「今天还没有签到」（截图确认），按钮文案改版也能识别
+_NOT_SIGNED_WORDS = ("今天还没有签到", "今日还未签到", "今天尚未签到", "今天还没签到")
 
 _SIGN_ACTION_WORDS = ("sign", "checkin", "submit", "do=", "op=", "ac=", "action=", "mod=", "qiandao")
 
@@ -339,6 +352,9 @@ def read_state(page: Page) -> str:
     # 按钮消失且出现已签到类文案（部分模板签到后按钮变成「签到成功」）
     if any(w in text for w in _ALREADY_LOOSE_WORDS):
         return "already"
+    # 按钮文案改版时，靠状态文字兜底识别「未签到」，避免误报 unknown 中断流程
+    if any(w in text for w in _NOT_SIGNED_WORDS):
+        return "ready"
     return "unknown"
 
 
@@ -456,7 +472,8 @@ def _form_fields(inner: str) -> Dict[str, str]:
 def discover_targets(page: Page, cfg: Config) -> List[Target]:
     """从签到页还原「立即签到」按钮背后的提交请求。
 
-    优先级：手动指定 > 按钮所在 form > a[href] > 按钮附近 JS/AJAX URL > 常见候选。
+    优先级：手动指定 > 抓包确认的官方接口 > 页面 form > a[href]
+            > 页面 JS/AJAX URL > 猜测候选。
     """
     targets: List[Target] = []
     src = page.html or ""
@@ -476,7 +493,21 @@ def discover_targets(page: Page, cfg: Config) -> List[Target]:
         targets.append(Target(_abs_url(url), method, data, "手动指定"))
         return targets
 
-    # 2) 按钮所在的 <form>
+    # 2) 抓包确认的官方接口：默认首选，零配置即可命中。
+    #    strict 只关「猜测候选」，官方接口始终保留；提交后仍会重新拉页复核。
+    official_method = cfg.method or "POST"
+    official_url = _abs_url(OFFICIAL_SUBMIT_PATH)
+    official_data: Dict[str, str] = {}
+    if official_method == "POST":
+        official_data = dict(OFFICIAL_FORM)
+        if fh:
+            official_data["formhash"] = fh
+    elif fh:
+        # 用户强制 GET 时把 formhash 移到 URL（不推荐，仅作兼容）
+        official_url += ("&" if "?" in official_url else "?") + "formhash=" + fh
+    targets.append(Target(official_url, official_method, official_data, "官方接口"))
+
+    # 3) 按钮所在的 <form>
     for m in re.finditer(r"<form\b([^>]*)>(.*?)</form>", src, re.I | re.S):
         attrs, inner = _tag_attrs(m.group(1)), m.group(2)
         if "立即签到" not in html_to_text(inner):
@@ -489,7 +520,7 @@ def discover_targets(page: Page, cfg: Config) -> List[Target]:
             method = "GET"
         targets.append(Target(_abs_url(attrs.get("action") or CHECKIN_URL), method, hidden, "页面表单"))
 
-    # 3) <a href> 按钮
+    # 4) <a href> 按钮
     for m in re.finditer(r"<a\b([^>]*)>(.*?)</a>", src, re.I | re.S):
         attrs = _tag_attrs(m.group(1))
         if "立即签到" not in html_to_text(m.group(2)):
@@ -502,7 +533,7 @@ def discover_targets(page: Page, cfg: Config) -> List[Target]:
             url += ("&" if "?" in url else "?") + "formhash=" + fh
         targets.append(Target(url, cfg.method or "GET", {}, "按钮链接"))
 
-    # 4) 页面里的 JS / AJAX URL（全页扫描：接口可能写在页尾脚本或独立 block）
+    # 5) 页面里的 JS / AJAX URL（全页扫描：接口可能写在页尾脚本或独立 block）
     found: List[str] = []
     for pat in (
         r"""["']((?:https?://club\.ugnas\.com/)?/?plugin\.php\?[^"'<>\s]{6,300})["']""",
@@ -525,7 +556,7 @@ def discover_targets(page: Page, cfg: Config) -> List[Target]:
             url += ("&" if "?" in url else "?") + "formhash=" + fh
         targets.append(Target(url, cfg.method or "GET", {}, "页面脚本"))
 
-    # 5) 常见 Discuz 签到插件形态兜底（可用 UGREEN_SIGNIN_STRICT=1 关闭）
+    # 6) 常见 Discuz 签到插件形态兜底（可用 UGREEN_SIGNIN_STRICT=1 关闭）
     if not cfg.strict:
         # DSU 系插件最常见的是 POST（参数在表单体），优先尝试以尽快命中
         if not cfg.method:
@@ -600,8 +631,15 @@ class UgreenHttp:
         return Page(url=str(getattr(resp, "url", "") or url), html=raw, text=text, formhash=self.formhash)
 
     def submit(self, target: Target) -> str:
-        headers = {"Referer": CHECKIN_URL, "X-Requested-With": "XMLHttpRequest"}
+        # 复刻抓包请求头：绿联签到是 AJAX 提交，Origin / X-Requested-With 需要带上
+        headers = {
+            "Referer": CHECKIN_URL,
+            "Origin": "https://club.ugnas.com",
+            "Accept": "*/*",
+            "X-Requested-With": "XMLHttpRequest",
+        }
         if target.method == "POST":
+            headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
             resp = self._post(target.url, target.data, headers=headers)
         else:
             resp = self._get(target.url, headers=headers)
@@ -715,8 +753,9 @@ class UgreenHttp:
             # 4) 确认未签到才提交
             log("{} 今日尚未签到，开始尝试签到".format(label))
             targets = discover_targets(page, self.cfg)
-            log("{} 共探测到 {} 个候选签到端点（formhash：{}）".format(
-                label, len(targets), "已获取" if page.formhash else "未获取"))
+            log("{} 共 {} 个提交端点（首选：{}｜formhash：{}）".format(
+                label, len(targets), targets[0].origin if targets else "无",
+                "已获取" if page.formhash else "未获取"))
             status = ""
             last_after: Optional[Page] = None
             for i, t in enumerate(targets, 1):
@@ -755,7 +794,10 @@ class UgreenHttp:
                 if self.cfg.debug and last_after is not None:
                     snippet = re.sub(r"\s+", " ", last_after.text or "").strip()[:300]
                     log("{} DEBUG 最后一次复核页文本：{}".format(label, snippet or "(空)"))
-                raise CheckinError("提交后未确认签到成功，请抓包配置 UGREEN_SIGNIN_SUBMIT_URL 或改用 browser 模式")
+                raise CheckinError(
+                    "提交后未确认签到成功（官方接口已尝试），请开 DEBUG 查看响应，"
+                    "或重新抓包配置 UGREEN_SIGNIN_SUBMIT_URL"
+                )
 
         # 5) 统一读积分信息；已签到分支复用前置确认时拉过的积分页
         stats = self.read_stats(page, credit_page=stats_credit)
