@@ -59,6 +59,15 @@ CREDIT_HTML = """
 </table>
 </body></html>
 """.format(d=TODAY)
+# 未签到时的积分页：没有任何当天的签到流水
+CREDIT_EMPTY_HTML = """
+<html><body>
+<div class="credit">积分：78</div>
+<table>
+<tr><td>积分规则</td><td>积分 +2</td><td>每天登录</td><td>2026-11-09 20:08</td></tr>
+</table>
+</body></html>
+"""
 
 FORM_HTML = """
 <form method="post" action="plugin.php?id=ugreen_checkin&amp;ac=do">
@@ -83,11 +92,13 @@ class _Resp:
 class ScriptedClient(m.UgreenHttp):
     """按脚本化状态机返回页面，模拟论坛服务端。"""
 
-    def __init__(self, cfg, signed=False, login=False, never_sign=False):
+    def __init__(self, cfg, signed=False, login=False, never_sign=False, credit_signed=None):
         super().__init__(VALID_COOKIE, cfg)
         self.signed = signed
         self.login = login
         self.never_sign = never_sign
+        # None = 积分流水跟随页面状态；True/False 用于单独验证兜底复核
+        self.credit_signed = credit_signed
         self.submits = []
 
     def _get(self, url, **kwargs):
@@ -102,12 +113,14 @@ class ScriptedClient(m.UgreenHttp):
         if self.login:
             return _Resp(LOGIN_HTML, url)
         if "ac=credit" in query:
-            return _Resp(CREDIT_HTML, url)
+            show = self.credit_signed if self.credit_signed is not None else self.signed
+            return _Resp(CREDIT_HTML if show else CREDIT_EMPTY_HTML, url)
         if "_t=" in query:  # 复核请求
             return _Resp(ALREADY_HTML if self.signed else READY_HTML, url)
         is_submit = any(k in query for k in (
             "ac=sign", "do=sign", "op=sign", "action=checkin",
             "signsubmit", "ugreen_checkin:sign", "ac=do_sign", "ac=do",
+            "operation=qiandao",
         ))
         if is_submit:
             self.submits.append((method, url))
@@ -164,6 +177,17 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(m.parse_streak("签到打卡 已连续签到 3 天"), 3)
         self.assertIsNone(m.parse_streak("无"))
 
+    def test_state_variants(self):
+        # 签到后按钮变成「签到成功」：按钮消失 + 宽松文案 → 已签到
+        html = "<div>已连续签到 4 天</div><button>签到成功</button>"
+        self.assertEqual(m.read_state(_page(html)), "already")
+        # 按钮还在，别处的「签到成功」提示不能算已签到
+        html2 = "<div>上次签到成功</div><button>立即签到</button>"
+        self.assertEqual(m.read_state(_page(html2)), "ready")
+        # 论坛改版后可自定义已签到文案
+        with patch.dict(os.environ, {"UGREEN_SIGNIN_ALREADY_KEYWORDS": "今日已打卡,明天见"}, clear=True):
+            self.assertEqual(m.read_state(_page("<div>今日已打卡</div>")), "already")
+
 
 class TestDiscover(unittest.TestCase):
     def test_form(self):
@@ -207,6 +231,36 @@ class TestDiscover(unittest.TestCase):
         cfg2 = m.Config(cookies=[VALID_COOKIE])
         self.assertTrue(any(t.origin == "候选接口" for t in m.discover_targets(_page(READY_HTML), cfg2)))
 
+    def test_form_fields_include_named_controls(self):
+        html = """
+        <form method="post" action="plugin.php?id=ugreen_checkin:sign&amp;operation=qiandao">
+          <input type="hidden" name="formhash" value="abc123def" />
+          <input type="radio" name="qdxq" value="kx" checked />
+          <input type="radio" name="qdxq" value="ng" />
+          <select name="qdmode"><option value="1">1</option><option value="2" selected>2</option></select>
+          <textarea name="todaysay">hi</textarea>
+          <button type="submit" name="signsubmit" value="yes">立即签到</button>
+        </form>
+        """
+        cfg = m.Config(cookies=[VALID_COOKIE], strict=True)
+        form = [t for t in m.discover_targets(_page(html), cfg) if t.origin == "页面表单"]
+        self.assertEqual(len(form), 1)
+        self.assertEqual(form[0].method, "POST")
+        self.assertEqual(form[0].data["formhash"], "abc123def")
+        self.assertEqual(form[0].data["qdxq"], "kx", "只取 checked 的单选")
+        self.assertEqual(form[0].data["qdmode"], "2")
+        self.assertEqual(form[0].data["todaysay"], "hi")
+        self.assertEqual(form[0].data["signsubmit"], "yes", "提交按钮参数不能丢")
+
+    def test_dsu_post_candidates(self):
+        cfg = m.Config(cookies=[VALID_COOKIE])
+        targets = m.discover_targets(_page(READY_HTML), cfg)
+        posts = [t for t in targets if t.origin == "候选接口" and t.method == "POST"]
+        self.assertTrue(posts, "应包含 DSU operation=qiandao 的 POST 形态")
+        self.assertTrue(any("operation=qiandao" in t.url for t in posts))
+        self.assertEqual(posts[0].data["qdxq"], "kx")
+        self.assertEqual(posts[0].data["formhash"], "abc123def")
+
 
 class TestFlow(unittest.TestCase):
     def test_success_with_recheck(self):
@@ -246,6 +300,24 @@ class TestFlow(unittest.TestCase):
         r = self._via_entry(cfg, never_sign=True)
         self.assertEqual(r.status, "failed")
         self.assertIn("未确认签到成功", r.message)
+
+    def test_credit_fallback_confirms(self):
+        """页面文案没变，但积分流水出现当天签到记录 → 判成功。"""
+        cfg = m.Config(cookies=[VALID_COOKIE])
+        client = ScriptedClient(cfg, never_sign=True, credit_signed=True)
+        r = client.run("账号1")
+        self.assertEqual(r.status, "success")
+        self.assertIn("积分记录确认", r.extra)
+
+    def test_credit_confirms_today_detects_record(self):
+        cfg = m.Config(cookies=[VALID_COOKIE])
+        self.assertTrue(ScriptedClient(cfg, credit_signed=True).credit_confirms_today())
+        self.assertFalse(ScriptedClient(cfg, credit_signed=False).credit_confirms_today())
+
+    def test_credit_verify_can_be_disabled(self):
+        cfg = m.Config(cookies=[VALID_COOKIE], credit_verify=False)
+        r = self._via_entry(cfg, never_sign=True, credit_signed=True)
+        self.assertEqual(r.status, "failed")
 
     def test_run_account_never_raises(self):
         cfg = m.Config(cookies=[VALID_COOKIE])

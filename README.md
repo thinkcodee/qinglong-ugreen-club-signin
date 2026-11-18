@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | 调度 | 宿主调度器 | 青龙定时任务 `0 8 * * *` |
 | 签到 | 浏览器点击按钮 | Cookie + HTTP 直连，自动探测提交端点 |
-| 状态判定 | 点击后 reload 复核 | 提交后**重新拉页复核**，不把「请求已发出」当成功 |
+| 状态判定 | 点击后 reload 复核 | 提交后**重新拉页复核**＋积分流水兜底，不把「请求已发出」当成功 |
 | 积分信息 | 余额 / 今日积分 / 连续天数 | 一致，沿用原解析规则 |
 | 通知 | MoviePilot 结构化渠道 | 青龙 notify.py → 青龙系统通知 → 11 种内置直推渠道 |
 | Cookie | 插件配置页 | 青龙环境变量 `UGREEN_COOKIE` |
@@ -77,7 +77,9 @@ Cookie 等同于账号登录态，不要提交到公开仓库或发到群里。�
 | `UGREEN_SIGNIN_SUBMIT_BODY` | 空 | POST 表单体，格式 `k1=v1&k2=v2`，支持 `{formhash}` |
 | `UGREEN_SIGNIN_METHOD` | 自动 | 强制 `GET` / `POST`，覆盖自动判断 |
 | `UGREEN_SIGNIN_STRICT` | `false` | `true` 时禁用内置候选接口，只用页面探测结果 |
-| `UGREEN_SIGNIN_DEBUG` | `false` | 打印探测细节，并把签到页 HTML 存成文件 |
+| `UGREEN_SIGNIN_CREDIT_VERIFY` | `true` | 页面文案没变时，用积分页**当天的签到流水**兜底复核；设 `false` 关闭 |
+| `UGREEN_SIGNIN_ALREADY_KEYWORDS` | 空 | 论坛改版后自定义「已签到」文案，逗号或竖线分隔，如 `今日已打卡,明天见` |
+| `UGREEN_SIGNIN_DEBUG` | `false` | 打印每个端点的响应摘要、复核页状态，并把签到页 HTML 存成文件 |
 | `UGREEN_SIGNIN_DEBUG_FILE` | 脚本同目录 `ugreen_signin_debug.html` | DEBUG 页面输出路径 |
 | `UGREEN_SIGNIN_FORCE_DIRECT` | `false` | `true` 时跳过青龙 notify.py / 系统通知，只用内置直推 |
 | `UGREEN_SIGNIN_UA` | 内置 Chrome UA | 自定义 User-Agent |
@@ -126,20 +128,26 @@ Cookie 等同于账号登录态，不要提交到公开仓库或发到群里。�
 脚本按这个顺序找「立即签到」背后的请求：
 
 1. 你手动配置的 `UGREEN_SIGNIN_SUBMIT_URL`（最可靠）
-2. 按钮所在的 `<form>`：`action` / `method` / 隐藏域（含 `formhash`）
+2. 按钮所在的 `<form>`：`action` / `method`，以及**全部具名控件**（隐藏域、提交按钮、单选、下拉、文本域，含 `formhash`）
 3. 按钮的 `<a href>`
 4. 按钮附近 JS / AJAX 里的 `plugin.php?...` 地址
-5. 内置 8 个常见 Discuz 签到插件接口（`UGREEN_SIGNIN_STRICT=true` 可关闭）
+5. 内置 Discuz「每日签到」(dsu_paulsign) 系接口：优先 `operation=qiandao` 的 **POST**（表单带 `qdxq` / `qdmode` / `todaysay` / `fastreply`），再试常见参数形态的 GET（`UGREEN_SIGNIN_STRICT=true` 可关闭）
 
-**每一次提交后都会重新拉签到页复核**，只有页面出现「今日已签到」才判成功，所以候选接口不会造成重复签到。
+**每一次提交后都会重新拉签到页复核**，页面变成「今日已签到」/「签到成功」等已签到状态才判成功；若论坛改版导致文案没变，脚本会再查一次积分页，**当天出现签到积分流水也算成功**。所有判定都基于持久化状态，候选接口不会造成重复签到。
+
+> 仍然失败时设 `UGREEN_SIGNIN_DEBUG=true`：会打印每个端点的 HTTP 状态与响应片段、复核页状态，以及最后一次复核页文本。把这段日志发出来即可定位真实接口。
 
 如果日志出现「提交后未确认签到成功」，按下面抓一次包即可永久锁定接口：
 
 1. 浏览器打开并登录 <https://club.ugnas.com/plugin.php?id=ugreen_checkin>，`F12 → Network` 勾选 `Preserve log`。
 2. 点击「立即签到」，找到新出现的 `plugin.php?...` 请求。
 3. 复制完整 **Request URL**，把里面 `formhash=` 的值换成 `{formhash}`，填到 `UGREEN_SIGNIN_SUBMIT_URL`。
-4. 若该请求是 `POST`，同时设 `UGREEN_SIGNIN_METHOD=POST`，并把表单参数填到 `UGREEN_SIGNIN_SUBMIT_BODY`（同样用 `{formhash}` 占位）。
+4. 若该请求是 `POST`，同时设 `UGREEN_SIGNIN_METHOD=POST`，并把 **Form Data 里的全部字段**填到 `UGREEN_SIGNIN_SUBMIT_BODY`（同样用 `{formhash}` 占位）。提交按钮的 `name=value`、心情 `qdxq`、模式 `qdmode` 等一个都别漏——少一个服务端可能直接忽略这次请求。
 5. 重跑任务。日志会显示「提交方式：手动指定」。
+
+> 绿联的签到插件很可能是 Discuz「每日签到」系定制版，真实请求通常长这样：
+> `POST plugin.php?id=ugreen_checkin:sign&operation=qiandao&inajax=1&infloat=1&formhash={formhash}`
+> 表单体：`formhash={formhash}&qdxq=kx&qdmode=2&todaysay=&fastreply=1`（插件 id 与参数以你抓到的为准）。脚本已内置这类候选，一般无需手动配置。
 
 也可设 `UGREEN_SIGNIN_DEBUG=true`，脚本会把签到页 HTML 存到 `ugreen_signin_debug.html`，方便查看按钮结构（文件可能含账号昵称，别公开发布）。
 
@@ -160,7 +168,8 @@ playwright install chromium
 | `论坛登录已失效，请更新 Cookie` | 重新复制 Cookie；检查是否含 `*_auth` |
 | `Cookie 中缺少登录凭证 *_auth` | 复制的是不完整 Cookie，重新取完整请求头 |
 | `未识别到签到按钮，论坛页面结构可能已变化` | 开 `DEBUG` 导出页面，或改 `browser` 模式 |
-| `提交后未确认签到成功` | 按上文抓包配置 `UGREEN_SIGNIN_SUBMIT_URL`，或改 `browser` 模式 |
+| `提交后未确认签到成功` | 开 `DEBUG` 看端点响应；按上文抓包配置 `UGREEN_SIGNIN_SUBMIT_URL`（POST 别漏表单字段），或改 `browser` 模式 |
+| `复核通过：积分页出现当日签到记录` | 签到其实成功了，只是页面文案已改版；可用 `UGREEN_SIGNIN_ALREADY_KEYWORDS` 补上新文案 |
 | `积分页读取失败（不影响签到结果）` | 积分页结构变化，签到本身仍成功，通知里只省略积分行 |
 | `未检测到可用的通知渠道` | 配置青龙 notify.py，或填任一推送变量 |
 | `缺少 requests 依赖` | 青龙依赖管理 → Python3 → 添加 `requests` |
@@ -169,7 +178,7 @@ playwright install chromium
 
 ```
 [08:00:02] 绿联社区签到开始 · 模式 http · 账号 1 个
-[08:00:03] 默认账号 共探测到 8 个候选签到端点（formhash：已获取）
+[08:00:03] 默认账号 共探测到 16 个候选签到端点（formhash：已获取）
 [08:00:05] 默认账号 复核通过：今日已签到（提交方式：候选接口（第 1 个端点））
 [08:00:06] ✅ 默认账号 · 签到成功 · 余额 78 · 今日 +1 · 连续 3 天
 [08:00:07] 签到结束：成功/已签到 1 个，失败 0 个
@@ -185,7 +194,7 @@ playwright install chromium
 python -m unittest discover -s tests -v
 ```
 
-覆盖：Cookie 校验、页面状态识别、formhash 提取、积分表格解析、四种端点探测方式、签到成功 / 今日已签到 / Cookie 失效 / 提交未确认、多账号通知文案。共 20 项。
+覆盖：Cookie 校验、页面状态识别（含改版文案与自定义关键词）、formhash 提取、积分表格解析、四种端点探测方式、DSU POST 候选、表单具名控件、签到成功 / 今日已签到 / Cookie 失效 / 提交未确认 / 积分流水兜底复核、多账号通知文案。共 26 项。
 
 ## 注意
 

@@ -8,12 +8,16 @@
 因此本脚本默认改为「Cookie + HTTP 直连」：
 
     拉取签到页 → 识别登录/已签到/可签到 → 自动探测签到提交端点
-    → 提交 → 重新拉页复核「今日已签到」→ 读取积分页 → 通知
+    → 提交 → 重新拉页复核已签到状态（含积分流水兜底）→ 读取积分页 → 通知
 
 保留原插件的三个关键约定：
   1. 不把「请求发出」或「按钮变化」当成功，必须复核持久化状态；
   2. 明确区分 Cookie 失效、页面结构变化、签到失败；
   3. 通知文案按原插件的人话排版，顺带读出积分余额、今日积分、连续天数。
+
+探测覆盖 Discuz「每日签到」(dsu_paulsign) 系的 operation=qiandao POST/GET 形态，
+表单探测会带上提交按钮、单选、下拉等具名控件；页面文案没变时再用积分页
+当天的签到流水做二次确认，避免论坛改版后误报失败。
 
 可选 UGREEN_SIGNIN_MODE=browser 走 Playwright 模式，逻辑与原插件一致（需自行安装
 playwright + chromium），用于 HTTP 自动探测失效时兜底。
@@ -61,9 +65,16 @@ _CREDIT_ROW_RE = re.compile(
     r"(?P<detail>.*?)\s+(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})\s+[0-9]{2}:[0-9]{2}$"
 )
 
-# 常见的 Discuz 签到插件提交形态，仅作自动探测失败后的兜底。
-# 命中后仍会重新拉页复核，只有页面变成「今日已签到」才算成功。
+# Discuz「每日签到」系插件（DSU/dsu_paulsign）的真实提交形态：
+# operation=qiandao + 心情/快捷回复等表单参数，且常为 POST。
+# 绿联的 ugreen_checkin 很可能是同系定制，因此优先尝试，命中仍需复核。
 _CANDIDATE_PATHS = [
+    "plugin.php?id=ugreen_checkin:sign&operation=qiandao&inajax=1&infloat=1&qdxq=kx&qdmode=2&todaysay=&fastreply=1&formhash={formhash}",
+    "plugin.php?id=ugreen_checkin&operation=qiandao&inajax=1&infloat=1&qdxq=kx&qdmode=2&todaysay=&fastreply=1&formhash={formhash}",
+    "plugin.php?id=ugreen_checkin:sign&operation=qiandao&inajax=1&qdxq=kx&qdmode=2&todaysay=&fastreply=1&formhash={formhash}",
+    "plugin.php?id=ugreen_checkin:sign&operation=qiandao&formhash={formhash}",
+    "plugin.php?id=ugreen_checkin&operation=qiandao&formhash={formhash}",
+    # 其他常见 Discuz 签到插件参数形态（兜底）
     "plugin.php?id=ugreen_checkin&ac=sign&formhash={formhash}",
     "plugin.php?id=ugreen_checkin&do=sign&formhash={formhash}",
     "plugin.php?id=ugreen_checkin&op=sign&formhash={formhash}",
@@ -74,7 +85,19 @@ _CANDIDATE_PATHS = [
     "plugin.php?id=ugreen_checkin&inajax=1&ac=sign&formhash={formhash}",
 ]
 
-_SIGN_ACTION_WORDS = ("sign", "checkin", "submit", "do=", "op=", "ac=", "action=", "mod=")
+# POST 时参数在表单体里，URL 上只带 formhash
+_DSU_POST_PATHS = [
+    "plugin.php?id=ugreen_checkin:sign&operation=qiandao&inajax=1&infloat=1&formhash={formhash}",
+    "plugin.php?id=ugreen_checkin&operation=qiandao&inajax=1&infloat=1&formhash={formhash}",
+    "plugin.php?id=ugreen_checkin:sign&operation=qiandao&inajax=1&formhash={formhash}",
+]
+_DSU_FORM = {"qdxq": "kx", "qdmode": "2", "todaysay": "", "fastreply": "1"}
+
+# 严格词直接判「已签到」；宽松词仅在「立即签到」按钮消失后生效，避免误报
+_ALREADY_STRICT_WORDS = ("今日已签到", "今天已签到", "今日已签", "您今天已经签到")
+_ALREADY_LOOSE_WORDS = ("已签到", "签到成功", "签到完成", "已经签到", "明日再来", "明天再来")
+
+_SIGN_ACTION_WORDS = ("sign", "checkin", "submit", "do=", "op=", "ac=", "action=", "mod=", "qiandao")
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -204,6 +227,7 @@ class Config:
     ua: str = DEFAULT_UA
     skip_cookie_check: bool = False
     browser_timeout: int = 90
+    credit_verify: bool = True
 
     @classmethod
     def load(cls) -> "Config":
@@ -230,6 +254,7 @@ class Config:
             ua=env("UGREEN_SIGNIN_UA", DEFAULT_UA),
             skip_cookie_check=env_bool("UGREEN_SIGNIN_SKIP_COOKIE_CHECK", False),
             browser_timeout=env_int("UGREEN_SIGNIN_BROWSER_TIMEOUT", 90, 30, 180),
+            credit_verify=env_bool("UGREEN_SIGNIN_CREDIT_VERIFY", True),
         )
 
 
@@ -301,10 +326,18 @@ def read_state(page: Page) -> str:
     text = page.text or ""
     if "您尚未登录" in text or "抱歉，您尚未登录" in text:
         return "login"
-    if "今日已签到" in text:
+    custom = [
+        w.strip() for w in re.split(r"[,，|]", env("UGREEN_SIGNIN_ALREADY_KEYWORDS"))
+        if w.strip()
+    ]
+    if any(w in text for w in tuple(custom) + _ALREADY_STRICT_WORDS):
         return "already"
+    # 按钮还在 → 一定没签到，哪怕页面别处出现「签到成功」之类的提示
     if "立即签到" in text:
         return "ready"
+    # 按钮消失且出现已签到类文案（部分模板签到后按钮变成「签到成功」）
+    if any(w in text for w in _ALREADY_LOOSE_WORDS):
+        return "already"
     return "unknown"
 
 
@@ -370,6 +403,41 @@ def parse_credit_text(text: str, today: Optional[str] = None) -> Stats:
     )
 
 
+def _form_fields(inner: str) -> Dict[str, str]:
+    """提取 form 内所有具名控件，而不只是 hidden。
+
+    Discuz 签到表单常靠 <button name="signsubmit"> 或 qdxq / qdmode 等字段
+    触发，只取 hidden 时请求虽发出但服务端会直接忽略，表现为「提交后未确认」。
+    """
+    fields: Dict[str, str] = {}
+    for im in re.finditer(r"<input\b([^>]*)>", inner, re.I):
+        raw, ia = im.group(1), _tag_attrs(im.group(1))
+        name = ia.get("name")
+        if not name:
+            continue
+        typ = ia.get("type", "").lower()
+        if typ in ("radio", "checkbox") and not re.search(r"\bchecked\b", raw, re.I):
+            continue
+        if typ in ("image", "file", "reset"):
+            continue
+        fields[name] = ia.get("value", "")
+    for bm in re.finditer(r"<button\b([^>]*)>", inner, re.I):
+        ba = _tag_attrs(bm.group(1))
+        if ba.get("name") and ba["name"] not in fields:
+            fields[ba["name"]] = ba.get("value", "")
+    for sm in re.finditer(r"<select\b([^>]*)>(.*?)</select>", inner, re.I | re.S):
+        sa = _tag_attrs(sm.group(1))
+        if not sa.get("name"):
+            continue
+        opt = re.search(r"<option\b([^>]*\bselected\b[^>]*)>", sm.group(2), re.I)
+        fields[sa["name"]] = _tag_attrs(opt.group(1)).get("value", "") if opt else ""
+    for tm in re.finditer(r"<textarea\b([^>]*)>(.*?)</textarea>", inner, re.I | re.S):
+        ta = _tag_attrs(tm.group(1))
+        if ta.get("name"):
+            fields[ta["name"]] = html_to_text(tm.group(2))
+    return fields
+
+
 def discover_targets(page: Page, cfg: Config) -> List[Target]:
     """从签到页还原「立即签到」按钮背后的提交请求。
 
@@ -398,13 +466,9 @@ def discover_targets(page: Page, cfg: Config) -> List[Target]:
         attrs, inner = _tag_attrs(m.group(1)), m.group(2)
         if "立即签到" not in html_to_text(inner):
             continue
-        hidden: Dict[str, str] = {}
-        for im in re.finditer(r"<input\b([^>]*)>", inner, re.I):
-            ia = _tag_attrs(im.group(1))
-            if ia.get("name") and ia.get("type", "").lower() in ("hidden", ""):
-                hidden[ia["name"]] = ia.get("value", "")
-        if fh and "formhash" not in hidden:
-            hidden["formhash"] = fh
+        hidden = _form_fields(inner)
+        if fh:
+            hidden.setdefault("formhash", fh)
         method = cfg.method or (attrs.get("method", "get").upper() or "GET")
         if method not in ("GET", "POST"):
             method = "GET"
@@ -448,6 +512,16 @@ def discover_targets(page: Page, cfg: Config) -> List[Target]:
 
     # 5) 常见 Discuz 签到插件形态兜底（可用 UGREEN_SIGNIN_STRICT=1 关闭）
     if not cfg.strict:
+        # DSU 系插件最常见的是 POST（参数在表单体），优先尝试以尽快命中
+        if not cfg.method:
+            for tpl in _DSU_POST_PATHS:
+                path = tpl.format(formhash=fh or "")
+                if not fh:
+                    path = path.replace("&formhash=", "").replace("?formhash=", "")
+                data = dict(_DSU_FORM)
+                if fh:
+                    data["formhash"] = fh
+                targets.append(Target(_abs_url(path), "POST", data, "候选接口"))
         for tpl in _CANDIDATE_PATHS:
             path = tpl.format(formhash=fh or "")
             if not fh:
@@ -515,7 +589,33 @@ class UgreenHttp:
             resp = self._post(target.url, target.data, headers=headers)
         else:
             resp = self._get(target.url, headers=headers)
-        return html_to_text(resp.text or "")
+        text = html_to_text(resp.text or "")
+        if self.cfg.debug:
+            snippet = re.sub(r"\s+", " ", text).strip()[:160] or "(空响应)"
+            log("DEBUG 提交 {} {} -> HTTP {} | {}".format(
+                target.method, target.url.split("?", 1)[-1][:110],
+                getattr(resp, "status_code", "?"), snippet))
+        return text
+
+    def credit_confirms_today(self) -> bool:
+        """积分页出现「当天 + 签到 + 积分」记录 = 签到已落库。
+
+        比页面文案可靠：论坛改版后按钮文字变了也能确认，避免误报失败。
+        """
+        try:
+            page = self.fetch(CREDIT_URL, cache_bust=True)
+        except Exception as err:
+            if self.cfg.debug:
+                log("DEBUG 积分页兜底复核失败：{}".format(err))
+            return False
+        day = datetime.now().strftime("%Y-%m-%d")
+        short = datetime.now().strftime("%m-%d")
+        for line in (page.text or "").splitlines():
+            if "签到" not in line or (day not in line and short not in line):
+                continue
+            if re.search(r"[+\-]\s*[0-9]|[0-9]\s*积分|积分\s*[+\-]", line):
+                return True
+        return False
 
     def read_stats(self, checkin_page: Page) -> Stats:
         stats = Stats()
@@ -575,14 +675,16 @@ class UgreenHttp:
             log("{} 共探测到 {} 个候选签到端点（formhash：{}）".format(
                 label, len(targets), "已获取" if page.formhash else "未获取"))
             status = ""
+            last_after: Optional[Page] = None
             for i, t in enumerate(targets, 1):
                 try:
-                    self.submit(t)
+                    reply = self.submit(t)
                 except Exception as err:
                     log("{} 第 {} 个端点请求异常：{}".format(label, i, err))
                     continue
                 # 关键：重新拉页复核持久化状态，不把请求发出当成功
                 after = self.fetch(CHECKIN_URL, cache_bust=True)
+                last_after = after
                 new_state = read_state(after)
                 if new_state == "login":
                     raise CookieExpiredError("签到过程中登录失效，请更新 Cookie")
@@ -594,8 +696,21 @@ class UgreenHttp:
                     log("{} 复核通过：今日已签到（{}）".format(label, extra))
                     break
                 if self.cfg.debug:
-                    log("{} 第 {} 个端点未改变状态（{}）".format(label, i, t.url.split("?", 1)[-1][:120]))
+                    snippet = re.sub(r"\s+", " ", reply or "").strip()[:80] or "(空)"
+                    log("{} 第 {} 个端点未改变状态（{}｜复核页 {}｜响应 {}）".format(
+                        label, i, t.url.split("?", 1)[-1][:100], new_state, snippet))
+            # 页面文案没变时用积分流水兜底复核：论坛改版换文案也不会误报失败
+            if not status and self.cfg.credit_verify:
+                if self.credit_confirms_today():
+                    status, message = "success", "签到成功"
+                    extra = "提交方式：积分记录确认（页面文案未变化）"
+                    if last_after is not None:
+                        page = last_after
+                    log("{} 复核通过：积分页出现当日签到记录".format(label))
             if not status:
+                if self.cfg.debug and last_after is not None:
+                    snippet = re.sub(r"\s+", " ", last_after.text or "").strip()[:300]
+                    log("{} DEBUG 最后一次复核页文本：{}".format(label, snippet or "(空)"))
                 raise CheckinError("提交后未确认签到成功，请抓包配置 UGREEN_SIGNIN_SUBMIT_URL 或改用 browser 模式")
 
         stats = self.read_stats(page)
